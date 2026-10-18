@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "types": [
+      "bun"
+    ],
+    "moduleResolution": "bundler",
+    "module": "ESNext",
+    "target": "ESNext",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+
+    // Por precaução
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
+  }
+}
