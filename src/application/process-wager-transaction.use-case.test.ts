@@ -21,7 +21,7 @@ async function createWallet(em: EntityManager, initial: string): Promise<{ walle
   return { walletId, playerId };
 }
 
-function makeInput(walletId: string, playerId: string, kind: WagerTransactionKind, amount: string, ext = randomUUID()) {
+function makeInput(walletId: string, playerId: string, kind: WagerTransactionKind, amount: string, ext: string = randomUUID()){
   return {
     providerId: 'provider-a',
     externalTransactionId: ext,
