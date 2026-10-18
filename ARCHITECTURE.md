@@ -25,7 +25,7 @@ Unidade de concorrência: **`walletId`**. Estratégia: **lock pessimista** via `
 
 **Por que pessimista e não otimista:** BET disputando saldo é o caso crítico. Com otimista, N tentativas concorrentes falham e precisam retry com backoff — latência não-determinística. Com pessimista, apenas acessos à mesma wallet serializam; wallets diferentes correm em paralelo. Sem lock global.
 
-**Cuidado crítico da v7 do MikroORM:** `em.getConnection().execute()` **não** garante binding à transação ativa. Na v7, o Knex foi removido; `tx.execute()` é a API correta, onde `tx` é o `EntityManager` transacional. Descobrimos isso durante o desenvolvimento: `getConnection().execute()` escapava do contexto e cada statement pegava uma conexão diferente do pool, fazendo o `FOR UPDATE` virar autocommit. Correção: `em.transactional(async (tx) => { ... tx.execute(...) })`.
+**Cuidado crítico da v7 do MikroORM:** `em.getConnection().execute(sql, params)` **sem** o contexto transacional não fica na transação ativa: cada statement pega uma conexão do pool e o `FOR UPDATE` vira autocommit. Descobrimos isso durante o desenvolvimento. Regra do projeto: sempre dentro de `em.transactional(async (tx) => ...)`, usando `tx.execute(...)` ou, no use case, o helper `q()` que passa `tx.getTransactionContext()` explicitamente à conexão. Os dois caminhos são equivalentes; o que nunca se faz é executar SQL pela conexão sem o contexto.
 
 **Cenário obrigatório (seção 8):** validado em `process-wager-transaction.use-case.test.ts` com duas conexões `em.fork()` em `Promise.all`: saldo 100, duas BET de 80 → 1 `PROCESSED`, 1 `REJECTED` (`INSUFFICIENT_FUNDS`), saldo final 20, 1 lançamento `DEBIT`.
 
@@ -60,7 +60,9 @@ Toda operação que altera saldo grava, **na mesma transação SQL**:
 
 **Nunca** publica antes do COMMIT.
 
-**Publisher:** loop 1s com `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 10` — seguro entre N publishers. Após o SELECT (transação curta), publica na SQS, depois `UPDATE outbox_message SET published_at = NOW() WHERE id = ? AND published_at IS NULL` como **barreira atômica final**: se outra instância publicou primeiro, o UPDATE afeta 0 linhas, sem duplicar.
+**Publisher:** loop 1s. Em **uma única transação** ele faz `SELECT ... FOR UPDATE OF o SKIP LOCKED LIMIT 10`, publica cada linha na SQS e marca `published_at`; o lock só é liberado no commit, então dois publishers nunca pegam as mesmas linhas. Se o envio funcionar mas o commit falhar, a reentrega usa o mesmo `MessageDeduplicationId` (id da linha) e a FIFO descarta o duplicado (janela de 5 min). O custo é segurar a transação durante o I/O de rede (lote de 10, aceitável).
+
+**Ordem por agregado:** uma linha só é elegível se não existe linha anterior (`occurred_at` menor) do mesmo `aggregate_id` ainda não publicada; se um envio falha, o restante do agregado é pulado no ciclo. Eventos com o mesmo `occurred_at` (mesma transação) não têm ordem garantida entre si.
 
 **Fila separada:** eventos de saída vão para `wager-events.fifo`, distinta de `wager-transactions.fifo` (entrada). Isso evita o consumer ler os próprios eventos como requests — foi um bug real descoberto em runtime.
 
@@ -82,12 +84,14 @@ Toda operação que altera saldo grava, **na mesma transação SQL**:
 **Consumer:**
 - Long polling, batch 10, `WaitTimeSeconds: 20`, `VisibilityTimeout: 30`
 - Ack (`DeleteMessage`) **só após commit**
-- Erro de negócio (`IdempotencyConflict`, `WalletNotFound`, `CurrencyMismatch`): terminal, ack para não travar fila
+- Payload validado pelo mesmo `validateWagerRequest` da API HTTP
+- **Erro permanente** (JSON inválido, payload inválido, valor ≤ 0, UUID malformado): vai **direto** para a DLQ, sem retries
+- Erro de negócio terminal (`IdempotencyConflict`, `WalletNotFound`, `CurrencyMismatch`): ack para não travar o grupo FIFO
 - Erro transitório (DB down, network): não ack, deixa visibilidade expirar → redelivery
 - `ApproximateReceiveCount >= 5`: move para DLQ com `reason`
-- Mensagem corrompida (`INVALID_JSON`): ack + DLQ
+- **DLQ primeiro, delete depois:** se o envio à DLQ falhar, a mensagem **não** é apagada da fila de origem (nunca se perde mensagem)
 - Filtro defensivo: se `type !== 'WagerTransactionRequested'`, ack (evita loop de evento em fila errada)
-- `SIGTERM`: para de pollar, aguarda `inFlight` zerar (deadline 25s), fecha conexões
+- `SIGTERM` (`enableShutdownHooks`): aborta o long poll em andamento, não inicia novas mensagens, espera a atual terminar (deadline 25s), fecha conexões. Mensagens já recebidas e não iniciadas voltam à fila quando a visibilidade expira
 
 ## 7. Taxonomia de FailureCode
 
@@ -106,13 +110,13 @@ Toda operação que altera saldo grava, **na mesma transação SQL**:
 
 `INSUFFICIENT_FUNDS` e `REVERSAL_WOULD_GO_NEGATIVE` são **distintos de propósito** — situações operacionais diferentes (cliente apostou demais vs. operador tentou rollback de transação já usada).
 
-**HTTP:** 400 payload inválido · 404 não encontrado · 409 conflito idempotência/wallet duplicada · 422 rejeição de negócio · 500/503 infra transitória.
+**HTTP:** 200 processada/replay · **202** `PENDING_REFERENCE` · 400 payload inválido (inclui valor ≤ 0, exceto LOSS, e UUID malformado) · 404 não encontrado · 409 conflito de idempotência (mesma key com payload diferente, ou mesmo `(providerId, externalTransactionId)` com outra key) / wallet duplicada · 422 rejeição de negócio · 503 infra transitória (erros inesperados também são logados).
 
 ## 8. Referências fora de ordem
 
 `REFUND`/`ROLLBACK` com referência ausente → persistido como `PENDING_REFERENCE` + evento `WagerTransactionPendingReference` na outbox.
 
-`PendingReferenceWorker` (stub no timebox): varre `PENDING_REFERENCE` em loop, reprocessa pelo mesmo use case, incrementa `reference_attempts`, após 5 tentativas marca `REJECTED` com `REFERENCE_NOT_FOUND` + `WagerTransactionRejected`.
+`PendingReferenceWorker`: varre `PENDING_REFERENCE` a cada 2s e reprocessa pelo **mesmo use case** (lock da wallet + re-checagem de status, seguro com N instâncias), com `pendingRetry: true`. Cada tentativa sem sucesso incrementa `wager_transaction.reference_attempts` (migration `20261017000000`); ao atingir 5 o use case marca `REJECTED` com `REFERENCE_NOT_FOUND` e emite `WagerTransactionRejected`. Backoff quadrático: a tentativa N só é elegível `N² × 2s` após a criação (rejeição final ≈ 32s). Replays do cliente com a mesma Idempotency-Key **não** contam como tentativa.
 
 ## 9. Autenticação (fora de escopo)
 
@@ -134,12 +138,13 @@ Toda operação que altera saldo grava, **na mesma transação SQL**:
 
 **Limitações conhecidas (honestas):**
 
-- `PendingReferenceWorker` é **stub** — interface pronta, lógica completa fora do timebox.
-- **Testes de concorrência extras não implementados:** 50× a mesma aposta, ≥3 instâncias, worker morto pós-commit. Os testes existentes cobrem: cenário obrigatório (2 conexões), FOR UPDATE sanity, redelivery (mesmo `messageId` 2×).
-- **Reconciliação** endpoint não implementado (ledger já permite auditoria).
-- **Observabilidade parcial:** logs JSON estruturados existem (`worker`, `messageId`, `walletId`, `outcome`), sem Prometheus/OpenTelemetry.
+- **Testes de concorrência multi-processo:** os testes de race usam várias conexões/forks no mesmo processo (2 apostas de 80, 50× a mesma aposta, 3 wallets em paralelo com invariante). Não há teste com ≥3 *processos* nem de "worker morto após commit, antes do ack".
+- **Testes do consumer SQS e dos controllers HTTP** não existem (dependem de LocalStack/app de pé); a lógica de validação e de domínio tem testes unitários.
+- **Observabilidade parcial:** logs JSON estruturados (`worker`, `messageId`, `walletId`, `outcome`), sem Prometheus/OpenTelemetry.
 - **Auth não implementada** — desenho acima.
-- **`PENDING_REFERENCE` sem coluna `reference_attempts`** — o stub não incrementa tentativas.
+- **Ordem de eventos:** eventos de um mesmo agregado com o mesmo `occurred_at` não têm ordem garantida (sem coluna de sequência).
+- **Outbox segura a transação durante o envio à SQS** (lote de 10); em volumes altos, preferir claim + publish fora da transação.
+- Consumer processa as mensagens de cada batch em série.
 
 **O que está sólido:**
 
@@ -150,3 +155,4 @@ Toda operação que altera saldo grava, **na mesma transação SQL**:
 - Ledger imutável (trigger no schema).
 - Outbox com publishers concorrentes sem duplicar.
 - Fluxo SQS end-to-end (input → consumer → use case → outbox → events queue).
+- `PENDING_REFERENCE` resolvido (ou rejeitado após 5 tentativas) pelo worker.

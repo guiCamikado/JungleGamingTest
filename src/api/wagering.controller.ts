@@ -1,116 +1,90 @@
 import {
-  Controller, Post, Get, Param, Body, Headers, HttpCode,
-  BadRequestException, NotFoundException, ConflictException,
-  UnprocessableEntityException, ServiceUnavailableException, UseGuards,
+  Controller, Post, Get, Param, Body, Headers, HttpCode, Res,
+  NotFoundException, BadRequestException, UnprocessableEntityException, UseGuards,
 } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
-import { Money, InvalidMoneyError } from '../domain/money';
-import { WagerTransactionKind, WagerTransactionStatus } from '../domain/wager-transaction';
+import { WagerTransactionStatus } from '../domain/wager-transaction';
+import { ProcessWagerTransactionUseCase } from '../application/process-wager-transaction.use-case';
 import {
-  ProcessWagerTransactionUseCase,
-  IdempotencyConflictError,
-  WalletNotFoundError,
-  CurrencyMismatchOnWalletError,
-} from '../application/process-wager-transaction.use-case';
+  validateWagerRequest, validateIdempotencyKey, isUuid,
+} from '../application/wager-request';
 import { AuthGuard } from './auth.guard';
+import { toHttpException } from './http-errors';
 
-interface CreateTransactionDto {
-  providerId: string;
-  externalTransactionId: string;
-  playerId: string;
-  walletId: string;
-  roundId: string;
-  gameId: string;
-  kind: string;
-  money: { amount: string; currency: string };
-  referenceExternalTransactionId?: string;
+/** Subconjunto do Response do Express usado aqui (evita depender de @types/express). */
+interface StatusSetter {
+  status(code: number): unknown;
 }
-
-const KIND_SET = new Set(['BET', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK']);
 
 @Controller()
 @UseGuards(AuthGuard)
 export class WageringController {
   constructor(private readonly em: EntityManager) {}
 
+  /**
+   * 200 processado (ou replay) · 202 PENDING_REFERENCE · 400 payload inválido ·
+   * 409 conflito de idempotência · 422 rejeição de negócio · 503 infra transitória.
+   */
   @Post('wagering/transactions')
+  @HttpCode(200)
   async create(
-    @Body() dto: CreateTransactionDto,
+    @Body() body: unknown,
+    @Res({ passthrough: true }) res: StatusSetter,
     @Headers('idempotency-key') idempotencyKey?: string,
     @Headers('x-correlation-id') correlationId?: string,
   ) {
-    if (!dto) throw new BadRequestException('body is required');
-    const required = ['providerId', 'externalTransactionId', 'playerId', 'walletId', 'roundId', 'gameId', 'kind', 'money'] as const;
-    for (const k of required) {
-      if (!(dto as any)[k]) throw new BadRequestException(`${k} is required`);
-    }
-    if (!KIND_SET.has(dto.kind)) {
-      throw new BadRequestException('kind must be one of BET, WIN, LOSS, REFUND, ROLLBACK');
-    }
-    if (dto.kind === 'REFUND' || dto.kind === 'ROLLBACK') {
-      if (!dto.referenceExternalTransactionId) {
-        throw new BadRequestException('referenceExternalTransactionId required for REFUND/ROLLBACK');
-      }
-    }
-
-    const key = idempotencyKey ?? `${dto.providerId}:${dto.externalTransactionId}`;
-
-    let money: Money;
     try {
-      money = Money.from(dto.money);
-    } catch (err) {
-      if (err instanceof InvalidMoneyError) throw new BadRequestException(err.message);
-      throw err;
-    }
+      const req = validateWagerRequest(body);
+      const key = validateIdempotencyKey(
+        idempotencyKey ?? `${req.providerId}:${req.externalTransactionId}`,
+      );
 
-    try {
       const uc = new ProcessWagerTransactionUseCase(this.em);
-      const result = await uc.execute({
-        providerId: dto.providerId,
-        externalTransactionId: dto.externalTransactionId,
-        idempotencyKey: key,
-        playerId: dto.playerId,
-        walletId: dto.walletId,
-        roundId: dto.roundId,
-        gameId: dto.gameId,
-        kind: dto.kind as WagerTransactionKind,
-        money,
-        referenceExternalTransactionId: dto.referenceExternalTransactionId,
-        correlationId,
-      });
+      const result = await uc.execute({ ...req, idempotencyKey: key, correlationId });
 
-      if (result.status === WagerTransactionStatus.Rejected) {
-        throw new UnprocessableEntityException({
-          transactionId: result.transactionId,
-          status: result.status,
-          failureCode: result.failureCode,
-          balance: result.balance.toJSON(),
-          idempotentReplay: result.idempotentReplay,
-        });
-      }
-      return {
+      const payload = {
         transactionId: result.transactionId,
         status: result.status,
         balance: result.balance.toJSON(),
         idempotentReplay: result.idempotentReplay,
       };
+
+      if (result.status === WagerTransactionStatus.Rejected) {
+        throw new UnprocessableEntityException({ ...payload, failureCode: result.failureCode });
+      }
+      if (result.status === WagerTransactionStatus.PendingReference) {
+        res.status(202);
+      }
+      return payload;
     } catch (err) {
-      if (err instanceof IdempotencyConflictError) throw new ConflictException(err.message);
-      if (err instanceof WalletNotFoundError) throw new NotFoundException(err.message);
-      if (err instanceof CurrencyMismatchOnWalletError) throw new BadRequestException(err.message);
-      if (err instanceof UnprocessableEntityException) throw err;
-      throw new ServiceUnavailableException('Transient infrastructure error, retry later');
+      throw toHttpException(err);
     }
   }
 
   @Get('wagering/transactions/:transactionId')
   async get(@Param('transactionId') transactionId: string) {
+    if (!isUuid(transactionId)) throw new BadRequestException('transactionId must be a UUID');
     const rows = await this.em.execute(
       `SELECT * FROM wager_transaction WHERE id = ?`,
       [transactionId],
     );
-    if (!rows[0]) throw new NotFoundException('Transaction not found');
-    const r = rows[0];
+    return this.present(rows[0]);
+  }
+
+  @Get('providers/:providerId/wagering/transactions/:externalTransactionId')
+  async getByExternal(
+    @Param('providerId') providerId: string,
+    @Param('externalTransactionId') externalTransactionId: string,
+  ) {
+    const rows = await this.em.execute(
+      `SELECT * FROM wager_transaction WHERE provider_id = ? AND external_transaction_id = ?`,
+      [providerId, externalTransactionId],
+    );
+    return this.present(rows[0]);
+  }
+
+  private present(r: any) {
+    if (!r) throw new NotFoundException('Transaction not found');
     return {
       transactionId: r.id,
       providerId: r.provider_id,
@@ -126,17 +100,5 @@ export class WageringController {
       processedAt: r.processed_at ?? null,
     };
   }
-
-  @Get('providers/:providerId/wagering/transactions/:externalTransactionId')
-  async getByExternal(
-    @Param('providerId') providerId: string,
-    @Param('externalTransactionId') externalTransactionId: string,
-  ) {
-    const rows = await this.em.execute(
-      `SELECT * FROM wager_transaction WHERE provider_id = ? AND external_transaction_id = ?`,
-      [providerId, externalTransactionId],
-    );
-    if (!rows[0]) throw new NotFoundException('Transaction not found');
-    return this.get(rows[0].id);
-  }
 }
+

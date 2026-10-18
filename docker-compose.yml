@@ -16,13 +16,15 @@ services:
       retries: 5
 
   localstack:
-    image: localstack/localstack:4.14   # <-- AQUI: versão fixa, sem exigir token
+    image: localstack/localstack:4.14   # versão fixa, sem exigir token
     container_name: junglegaming-localstack-1
     ports:
       - "4566:4566"
     environment:
       - SERVICES=sqs
       - DEBUG=0
+    volumes:
+      - ./localstack-init:/etc/localstack/init/ready.d:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:4566/_localstack/health || exit 1"]
       interval: 5s

@@ -6,6 +6,7 @@ import {
   WagerTransaction,
   WagerTransactionKind,
   WagerTransactionStatus,
+  InvalidWagerAmountError,
   type FailureCode,
 } from '../domain/wager-transaction';
 import { WalletLedgerEntry, LedgerDirection } from '../domain/wallet-ledger-entry';
@@ -24,6 +25,9 @@ export class CurrencyMismatchOnWalletError extends Error {
   }
 }
 
+/** Tentativas de resolver a referência antes de rejeitar com REFERENCE_NOT_FOUND. */
+export const MAX_REFERENCE_ATTEMPTS = 5;
+
 export interface ProcessWagerInput {
   providerId: string;
   externalTransactionId: string;
@@ -38,6 +42,11 @@ export interface ProcessWagerInput {
   consumerName?: string;
   messageId?: string;
   correlationId?: string;
+  /**
+   * true quando a chamada vem do PendingReferenceWorker: cada tentativa sem
+   * sucesso incrementa `reference_attempts`. Replays do cliente não contam.
+   */
+  pendingRetry?: boolean;
 }
 
 export interface ProcessWagerResult {
@@ -75,6 +84,11 @@ export class ProcessWagerTransactionUseCase {
   constructor(private readonly em: EntityManager) {}
 
   async execute(input: ProcessWagerInput): Promise<ProcessWagerResult> {
+    // Só LOSS pode ter valor zero; o ledger exige amount > 0.
+    if (input.kind !== WagerTransactionKind.Loss && !input.money.isPositive()) {
+      throw new InvalidWagerAmountError(input.kind);
+    }
+
     const payloadHash = hashWagerBusinessFields({
       providerId: input.providerId,
       externalTransactionId: input.externalTransactionId,
@@ -155,6 +169,18 @@ export class ProcessWagerTransactionUseCase {
         txDomain = existing;
         isExisting = true;
       } else {
+        // Mesmo (provider, externalTransactionId) com outra Idempotency-Key é conflito (409),
+        // não erro de infraestrutura.
+        const sameExternal = await this.q(
+          tx,
+          `SELECT 1 FROM wager_transaction WHERE provider_id = ? AND external_transaction_id = ?`,
+          [input.providerId, input.externalTransactionId],
+        );
+        if (sameExternal.length > 0) {
+          throw new IdempotencyConflictError(
+            `Transaction ${input.providerId}/${input.externalTransactionId} already exists with a different Idempotency-Key`,
+          );
+        }
         if (wallet.currency !== input.money.currency) {
           throw new CurrencyMismatchOnWalletError(wallet.currency, input.money.currency);
         }
@@ -193,6 +219,17 @@ export class ProcessWagerTransactionUseCase {
         if (referenceUnresolved) {
           txDomain.markPendingReference();
           if (isExisting) {
+            if (input.pendingRetry) {
+              const upd = await this.q<{ reference_attempts: number }>(
+                tx,
+                `UPDATE wager_transaction SET reference_attempts = reference_attempts + 1
+                 WHERE id = ? RETURNING reference_attempts`,
+                [txDomain.id],
+              );
+              if ((upd[0]?.reference_attempts ?? 0) >= MAX_REFERENCE_ATTEMPTS) {
+                return this.rejectAndPersist(tx, txDomain, true, wallet, 'REFERENCE_NOT_FOUND', input);
+              }
+            }
             // Retry sem progresso: nada novo a persistir nem a emitir.
             return {
               transactionId: txDomain.id,

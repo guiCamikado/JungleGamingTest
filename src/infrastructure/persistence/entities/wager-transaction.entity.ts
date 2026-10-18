@@ -61,6 +61,9 @@ export class WagerTransactionEntity {
   @Property({ fieldName: 'failure_code', type: 'varchar', length: 64, nullable: true })
   failureCode?: string;
 
+  @Property({ fieldName: 'reference_attempts', type: 'int', default: 0 })
+  referenceAttempts: number = 0;
+
   @Property({ fieldName: 'created_at', type: 'timestamptz' })
   createdAt!: Date;
 

@@ -1,13 +1,10 @@
 import { SQSClient } from '@aws-sdk/client-sqs';
+import { config } from '../../config';
 
 export const sqs = new SQSClient({
-  endpoint: 'http://127.0.0.1:4566',
-  region: 'us-east-1',
-  credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+  endpoint: config.sqs.endpoint,
+  region: config.sqs.region,
+  credentials: config.sqs.credentials,
 });
 
-export const QUEUE_URLS = {
-  transactions: 'http://127.0.0.1:4566/000000000000/wager-transactions.fifo',
-  events: 'http://127.0.0.1:4566/000000000000/wager-events.fifo',
-  dlq: 'http://127.0.0.1:4566/000000000000/wager-transactions-dlq.fifo',
-} as const;
+export const QUEUE_URLS = config.sqs.queues;

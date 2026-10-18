@@ -44,6 +44,13 @@ export class ReferenceRequiredError extends Error {
   }
 }
 
+export class InvalidWagerAmountError extends Error {
+  constructor(kind: string) {
+    super(`${kind} amount must be greater than zero`);
+    this.name = 'InvalidWagerAmountError';
+  }
+}
+
 export interface CreateWagerTransactionProps {
   id: string;
   providerId: string;
@@ -106,7 +113,11 @@ export class WagerTransaction {
       throw new ReferenceRequiredError(props.kind);
     }
     if (props.money.isNegative()) {
-      throw new Error('money cannot be negative on input');
+      throw new InvalidWagerAmountError(props.kind);
+    }
+    // Só LOSS pode ter valor zero (não gera lançamento no ledger, que exige amount > 0).
+    if (props.kind !== WagerTransactionKind.Loss && !props.money.isPositive()) {
+      throw new InvalidWagerAmountError(props.kind);
     }
 
     return new WagerTransaction(

@@ -50,55 +50,68 @@ export class OutboxPublisherWorker {
     }, this.pollMs);
   }
 
+  /**
+   * Um ciclo: seleciona, publica e marca publicado DENTRO da mesma transação, mantendo o
+   * lock (FOR UPDATE SKIP LOCKED) até o commit. Assim dois publishers nunca pegam as mesmas
+   * linhas. Se o commit falhar depois do envio, a reentrega usa o mesmo MessageDeduplicationId
+   * (id da linha), então a FIFO descarta o duplicado.
+   *
+   * Ordem por agregado: uma linha só é elegível se não há linha anterior do mesmo agregado
+   * ainda não publicada; e, se um envio falha, o restante do agregado é pulado no ciclo.
+   */
   private async tick(): Promise<void> {
     this.inFlight++;
     try {
-      const rows: OutboxRow[] = await this.em.transactional(async (tx) => {
-        const picked = await tx.execute(
+      await this.em.transactional(async (tx) => {
+        const rows = (await tx.execute(
           `SELECT id, aggregate_id, event_type, payload, attempts
-           FROM outbox_message
-           WHERE published_at IS NULL
-             AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
-           ORDER BY occurred_at ASC
+           FROM outbox_message o
+           WHERE o.published_at IS NULL
+             AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= NOW())
+             AND NOT EXISTS (
+               SELECT 1 FROM outbox_message prev
+               WHERE prev.aggregate_id = o.aggregate_id
+                 AND prev.published_at IS NULL
+                 AND prev.occurred_at < o.occurred_at
+             )
+           ORDER BY o.occurred_at ASC
            LIMIT ?
-           FOR UPDATE SKIP LOCKED`,
+           FOR UPDATE OF o SKIP LOCKED`,
           [this.batchSize],
-        );
-        return picked as OutboxRow[];
-      });
+        )) as OutboxRow[];
 
-      for (const row of rows) {
-        try {
-          await sqs.send(
-            new SendMessageCommand({
-              QueueUrl: QUEUE_URLS.events,
-              MessageBody: JSON.stringify(row.payload),
-              MessageGroupId: row.aggregate_id,
-              MessageDeduplicationId: row.id,
-            }),
-          );
-          await this.em.transactional(async (tx) => {
+        const failedAggregates = new Set<string>();
+        for (const row of rows) {
+          if (failedAggregates.has(row.aggregate_id)) continue;
+          try {
+            await sqs.send(
+              new SendMessageCommand({
+                QueueUrl: QUEUE_URLS.events,
+                MessageBody: JSON.stringify(row.payload),
+                MessageGroupId: row.aggregate_id,
+                MessageDeduplicationId: row.id,
+              }),
+            );
             await tx.execute(
               `UPDATE outbox_message SET published_at = NOW() WHERE id = ? AND published_at IS NULL`,
               [row.id],
             );
-          });
-        } catch (err) {
-          await this.em.transactional(async (tx) => {
+          } catch (err) {
+            failedAggregates.add(row.aggregate_id);
             await tx.execute(
               `UPDATE outbox_message
                SET attempts = attempts + 1,
-                   next_attempt_at = NOW() + (LEAST(POWER(2, attempts + 1) * INTERVAL '1 second', INTERVAL '60 seconds'))
+                   next_attempt_at = NOW() + LEAST(POWER(2, attempts + 1) * INTERVAL '1 second', INTERVAL '60 seconds')
                WHERE id = ? AND published_at IS NULL`,
               [row.id],
             );
-          });
-          console.error(JSON.stringify({
-            level: 'error', worker: 'outbox', eventType: row.event_type,
-            outboxId: row.id, attempts: row.attempts + 1, error: String(err),
-          }));
+            console.error(JSON.stringify({
+              level: 'error', worker: 'outbox', eventType: row.event_type,
+              outboxId: row.id, attempts: row.attempts + 1, error: String(err),
+            }));
+          }
         }
-      }
+      });
     } finally {
       this.inFlight--;
     }
